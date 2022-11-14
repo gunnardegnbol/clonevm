@@ -1,0 +1,43 @@
+#!/bin/bash
+# vmip (c) 2022 Gunnar Degnbol
+
+[ "$1" == "--connect" ] || [ "$1" == "-c" ] && [ "$2" != "" ] && URI=$2 && shift 2
+[ "$URI" == "" ] && URI=qemu:///system
+[ "$1" == "--subnet" ] || [ "$1" == "-s" ] && [ "$2" != "" ] && SUBNET=$2 && shift 2
+if [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
+	echo "Usage: vmip.sh [--connect URI] [--subnet subnet] [vmname]
+
+vmip.sh gets the IP address(es) of a running VM or all VMs.
+vmip.sh requires virsh and fping."
+	exit
+fi
+
+[ "$(which virsh)" == "" ] && echo "Error: virsh is not installed" && exit 1
+[ "$(which fping)" == "" ] && echo "Error: fping is not installed" && exit 1
+VM=$1
+VMS=$(virsh -c $URI list | awk '/running/ {print $2}' | sort)
+[ "$VM" != "" ] && [ "$(echo "$VMS" | grep "^$VM$")" == "" ] && echo "$VM is not running" && exit 1
+[ "$VM" != "" ] && VMS=$VM
+
+echo "$VMS" | while IFS= read -r VM; do
+	virsh -c $URI domiflist $VM | grep : | while IFS= read -r INTERFACE; do
+		MAC=$(echo $INTERFACE | awk '{print $5}')
+		IP=$(arp -n | awk "/$MAC/ {print \$1}")
+		if [ "$IP" == "" ]; then
+			VMSUBNET=$SUBNET
+			if [ "$VMSUBNET" == "" ]; then 
+				TYPE=$(echo $INTERFACE | awk '{print $2}')
+				BRIDGE=$(echo $INTERFACE | awk '{print $3}')
+				[ "$TYPE" == "network" ] && BRIDGE=$(virsh -c $URI net-info $BRIDGE | awk '/Bridge:/ {print $2}')
+				[ "$BRIDGE" == "" ] && echo "Error: Can't get bridge for $VM" && exit 1
+				VMSUBNET=$(ip -f inet addr | awk "/scope global $BRIDGE\$/ {print \$2}")
+				[ "$VMSUBNET" == "" ] && echo "Error: Can't get subnet for bridge $BRIDGE" && exit 1
+			fi
+			fping -q -c 1 -i 5 -t 100 -g $VMSUBNET 2>&1 | grep -v "xmt/rcv/%loss"
+			IP=$(arp -n | awk "/$MAC/ {print \$1}")
+		fi
+		echo -n "$IP"
+		[ "$1" == "" ] && echo -n " $VM"
+		echo
+	done
+done

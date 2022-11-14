@@ -1,0 +1,69 @@
+#!/bin/bash
+# clonevm (c) 2022 Gunnar Degnbol
+
+[ "$1" == "--connect" ] || [ "$1" == "-c" ] && [ "$2" != "" ] && URI=$2 && shift 2
+[ "$URI" == "" ] && URI=qemu:///system
+[ "$1" == "--subnet" ] || [ "$1" == "-s" ] && [ "$2" != "" ] && SUBNET=$2 && shift 2
+TEMPLATE=$1
+VM=$2
+if [ "$VM" == "" ] || [ "$3" != "" ]; then
+	echo "Usage: clonevm [--connect URI] [--subnet subnet] template newvm
+
+clonevm clones a libvirt VM running Linux or BSD with OpenSSH or Dropbear.
+
+clonevm requires virsh, virt-clone and fping."
+	exit
+fi
+
+echo "Initializing..."
+[ "$(which virsh)" == "" ] && echo "Error: virsh is not installed" && exit 1
+[ "$(which virt-clone)" == "" ] && echo "Error: virt-clone is not installed" && exit 1
+[ "$(which fping)" == "" ] && echo "Error: fping is not installed" && exit 1
+VMS=$(virsh -c $URI list --all) || exit 1
+[ "$(echo "$VMS" | grep running$ | grep " $TEMPLATE ")" != "" ] && echo "Error: $TEMPLATE is running" && exit 1
+[ "$(echo "$VMS" | grep " $TEMPLATE ")" == "" ] && echo "Error: $TEMPLATE is not defined" && exit 1
+[ "$(echo "$VMS" | grep " $VM ")" != "" ] && echo "Error: $VM already exists" && exit 1
+
+MAC=$(printf "52:54:00:%02x:%02x:%02x" $(($RANDOM % 128)) $(($RANDOM % 128)) $(($RANDOM % 128)))
+if [ "$SUBNET" == "" ]; then
+	INTERFACE=$(virsh -c $URI domiflist $TEMPLATE | grep :)
+	[ "$(echo "$INTERFACE" | wc -l)" != "1" ] && echo "Error: Can't clone VM with more than one network card" && exit 1
+	TYPE=$(echo $INTERFACE | awk '{print $2}')
+	BRIDGE=$(echo $INTERFACE | awk '{print $3}')
+	[ "$TYPE" == "network" ] && BRIDGE=$(virsh -c $URI net-info $BRIDGE | awk '/Bridge:/ {print $2}')
+	[ "$BRIDGE" == "" ] && echo "Error: Can't get network bridge" && exit 1
+	SUBNET=$(ip -f inet addr | awk "/scope global $BRIDGE\$/ {print \$2}") 
+	[ "$SUBNET" == "" ] && echo "Error: Can't get subnet for $BRIDGE" && exit 1
+fi
+
+echo "Cloning $TEMPLATE..."
+virt-clone --connect $URI --original $TEMPLATE --name $VM --mac $MAC --auto-clone || exit 1
+virsh -c $URI start $VM || exit 1
+
+echo -n "Waiting for $VM to show up in $SUBNET..."
+while [ "$IP" == "" ]; do
+	fping -q -c 1 -i 5 -t 100 -g $SUBNET 2>&1 | grep -v "xmt/rcv/%loss"
+	IP=$(arp -n | awk "/$MAC/ {print \$1}")
+	echo -n "."
+done
+echo
+echo "IP address: $IP"
+
+echo -n "Waiting for ssh..."
+while ! nc -z $IP 22; do
+	sleep 2
+	echo -n "."
+done
+echo 
+
+echo "Setting hostname and generating new ssh host keys..."
+echo '#!/bin/sh
+[ -f /etc/hostname ] && echo $1 > /etc/hostname
+[ -f /etc/rc.conf ] && echo hostname=\"$1\" >> /etc/rc.conf
+hostname $1
+for ALGO in rsa dsa dss ecdsa ed25519; do
+	[ -f /etc/ssh/ssh_host_${ALGO}_key ] && echo y | ssh-keygen -q -N "" -t $ALGO -f /etc/ssh/ssh_host_${ALGO}_key > /dev/null
+	[ -f /etc/dropbear/dropbear_${ALGO}_host_key ] && rm /etc/dropbear/dropbear_${ALGO}_host_key && dropbearkey -t $ALGO -f /etc/dropbear/dropbear_${ALGO}_host_key > /dev/null 
+done' | ssh -q -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=accept-new root@$IP "cat > cloneinit.sh; chmod +x cloneinit.sh; ./cloneinit.sh $VM; rm cloneinit.sh"
+
+echo "$VM is ready"
